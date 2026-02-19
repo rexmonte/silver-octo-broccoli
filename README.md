@@ -1,111 +1,94 @@
 # silver-octo-broccoli
 MacMini openclaw
 
-## Discord bot troubleshooting (connected, model switched, but replies still delayed)
+## Discord bot troubleshooting (online but not replying)
 
-## What your latest logs confirm
+You are absolutely thinking about this the right way: if `qwen3-coder:30b` is stalling, you should switch to a smaller local model (like 14B) or use a cloud provider profile (Anthropic).
 
-Your most recent evidence is good progress:
+Your logs show the gateway/Discord side is working, but generation is timing out:
 
-- Gateway starts cleanly and listens on `127.0.0.1:18789`.
-- Discord provider starts and logs in successfully.
-- Active model is now `ollama/qwen3:14b`.
-- New Discord run starts with `sessionId=473677db-...` and `thinking=off`.
+- `logged in to discord as ...` ✅ (Discord auth works)
+- `embedded run start ... model=qwen3-coder:30b` ✅ (message reached agent)
+- `typing TTL reached (2m)` ⚠️ (no timely model completion)
 
-So the major blocker from earlier (stuck on 30B) is fixed.
+That means the bottleneck is **model/profile selection and latency**, not basic bot connectivity.
 
-## New clues from the latest run
+## Direct answer: "Why not just use other models?"
 
-You also now have:
+Usually one of these is happening:
 
-- `Removed orphaned user message to prevent consecutive user turns`
-- Bonjour name/hostname conflict auto-renaming (`... (2)` / `openclaw-(2)`)
+1. OpenClaw is pinned to a specific profile/model (`ollama/qwen3-coder:30b`) for that channel/session.
+2. Other local models exist on disk but are not selected as the active profile.
+3. The fallback profile (like Anthropic) is not configured with a valid API key, so fallback cannot succeed.
 
-Interpretation:
+So yes — your proposed fix is exactly the right move.
 
-- The orphaned-user-message warning points to **session-turn state drift**, which can prevent a normal assistant turn from being posted.
-- The Bonjour rename warning is usually benign for Discord replies; it is not the primary blocker.
+## Fastest recovery path
 
-## New actionable item from logs
-
-Your output includes:
-
-- `Run "openclaw doctor --fix" to apply changes.`
-
-Run that first, then restart gateway once:
+### 1) Keep one gateway process only
 
 ```bash
-openclaw doctor --fix
-openclaw gateway stop
-openclaw gateway
-```
-
-## Focused validation sequence
-
-### 1) Confirm model + Discord wiring
-
-```bash
+lsof -nP -iTCP:18789 -sTCP:LISTEN
 openclaw logs --follow
 ```
 
-Send `ping` in Discord, and verify you get all of these in order:
+If duplicate start conflicts return, cleanly restart one instance:
 
-1. `embedded run start ... model=qwen3:14b`
-2. no orphaned-user-message warning for that turn
-3. `embedded run agent end ... isError=false` (or equivalent successful completion)
-4. a posted Discord reply (not only typing indicator)
+```bash
+openclaw gateway stop
+launchctl bootout gui/$UID/ai.openclaw.gateway 2>/dev/null || true
+openclaw gateway
+```
 
-### 2) If run starts but reply still never posts
+### 2) Switch from 30B to a 14B (or smaller) local model
 
-Capture 2–3 minutes of logs around a single `ping` and check for:
+1. List locally available models:
 
-- `Removed orphaned user message ...`
-- `typing TTL reached (2m)`
-- `embedded run timeout ... 600000`
-- `embedded run agent end ... isError=true`
-- `Slow listener detected`
+```bash
+ollama list
+```
 
-If any appear, apply the tuning below.
+2. Pick a faster model you already have (for example a 14B instruct model).
+3. In OpenClaw, set the active Discord agent/profile model from `qwen3-coder:30b` to that faster model.
+4. Send a tiny Discord test prompt: `ping`.
 
+If you still get typing timeout, drop again to 7B/8B.
 
-### 3) Treat 214.7s slow listener as a latency failure
+### 3) Enable Anthropic fallback (if desired)
 
-Your latest log (`DiscordMessageListener took 214.7 seconds`) means the event loop is still blocked too long for good chat UX, even though it is better than a full 600s timeout.
+If you want cloud fallback when local inference is slow:
 
-Apply these immediately:
+1. Add a valid `ANTHROPIC_API_KEY` to the OpenClaw environment/profile that the gateway actually uses.
+2. Enable/select an Anthropic profile in OpenClaw and make sure it is allowed as a fallback for Discord runs.
+3. Restart gateway after key/profile changes.
 
-- Reduce Discord max output tokens further.
-- Keep prompts short during testing (`ping`, `one sentence only`).
-- Prefer `qwen3:8b` for Discord if 14B keeps exceeding ~30–60s response time.
-- Keep Anthropic fallback enabled so stalled local runs do not block replies for minutes.
+Then test in Discord and confirm logs show the Anthropic profile being selected when local runs stall.
 
-## Tuning order (lowest risk first)
+### 4) Clean stale session state (recommended once)
 
-1. Keep `qwen3:14b`, but lower Discord max output tokens.
-2. Keep `thinking=off` (already present in logs).
-3. Reduce run timeout for Discord profile so failures happen faster.
-4. If still slow, switch Discord profile to `qwen3:8b`.
-5. Add Anthropic as first fallback for Discord profile.
-
-## Session hygiene (recommended if orphaned-message warning appears)
+Your log had orphaned-turn cleanup warnings, so do a one-time session cleanup:
 
 ```bash
 openclaw gateway stop
 mkdir -p ~/.openclaw/backup
 cp -a ~/.openclaw/agents/main/sessions ~/.openclaw/backup/sessions.$(date +%Y%m%d-%H%M%S)
 rm -f ~/.openclaw/agents/main/sessions/*.lock
-# optional: rotate the active session map to force clean turn state rebuild
-mv ~/.openclaw/agents/main/sessions/sessions.json \
-   ~/.openclaw/backup/sessions.json.$(date +%Y%m%d-%H%M%S) 2>/dev/null || true
 openclaw gateway
 ```
 
-## Practical current diagnosis
+## Validation checklist
 
-Right now the system appears **mostly healthy**:
+After changing models/profiles, this is what "fixed" looks like in logs:
 
-- Connectivity: good
-- Model selection: good (`qwen3:14b`)
-- Remaining likely issues: session-turn state integrity + response latency (214.7s slow listener)
+- You still see `logged in to discord`.
+- `embedded run start` uses your new chosen profile/model (14B or Anthropic), not `qwen3-coder:30b`.
+- You no longer see `typing TTL reached (2m)` for short prompts.
+- Discord receives a response within a few seconds.
 
-That's why the next step is a strict `ping` test + completion-log confirmation, then session reset/tuning if orphaned-message or slow-listener warnings repeat.
+## Practical recommendation
+
+For reliability, start with this order:
+
+1. Fast local model (7B/14B) as primary.
+2. Anthropic as fallback if local generation exceeds latency budget.
+3. Keep 30B for manual/high-quality tasks, not interactive Discord chat.
