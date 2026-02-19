@@ -1,66 +1,87 @@
 # silver-octo-broccoli
 MacMini openclaw
 
-## Discord bot troubleshooting (gateway healthy, config apply failing)
+## Discord bot troubleshooting (gateway supervision + invalid config + latency)
 
 ## What your latest logs confirm
 
-From your newest log block:
+You now have three overlapping issues:
 
-- Gateway startup is healthy (canvas/heartbeat/health-monitor running).
-- Discord provider starts and logs in correctly.
-- Active model is still `ollama/qwen3:14b`.
-- `config.get` succeeds, but `config.apply` fails with `INVALID_REQUEST`.
-- Tool layer then reports `gateway failed: invalid config`.
+1. **Gateway supervision conflict**
+   - `Gateway failed to start: gateway already running (pid 10148)`
+   - `Port 18789 is already in use`
+2. **Config apply failure**
+   - `config.apply ... INVALID_REQUEST`
+   - `gateway failed: invalid config`
+3. **Runtime latency**
+   - `typing TTL reached (2m)`
+   - `Slow listener detected` / 600s-class timeouts
 
-This means core connectivity is fine, but **a config payload being sent over WS is invalid**.
+So this is not one bug; it is a startup-control problem + config-validation problem + performance problem.
 
-## Key interpretation
+## Fix order (important)
 
-Because `config.get` works and `config.apply` fails immediately, the issue is likely not transport/auth. It is most likely one or more invalid fields/values in the apply request body.
+### 1) Resolve gateway supervision conflict first
 
-Also, `typing TTL reached (2m)` indicates reply latency remains a second issue, but config validity must be fixed first.
+You cannot reliably debug config or latency while two startup modes conflict.
 
-## Fix order (do this in sequence)
+```bash
+# stop supervised/manual gateway if running
+openclaw gateway stop
+launchctl bootout gui/$UID/ai.openclaw.gateway 2>/dev/null || true
 
-### 1) Stabilize baseline gateway state
+# verify port is free
+lsof -nP -iTCP:18789 -sTCP:LISTEN
+```
+
+Then choose **one** mode only:
+
+- Foreground/manual: `openclaw gateway`
+- LaunchAgent-supervised: `launchctl bootstrap gui/$UID ~/Library/LaunchAgents/ai.openclaw.gateway.plist`
+
+Do not run both.
+
+### 2) If `launchctl bootstrap ... Input/output error` persists
+
+That usually means stale/bad LaunchAgent state or plist mismatch. Reset it:
+
+```bash
+launchctl bootout gui/$UID/ai.openclaw.gateway 2>/dev/null || true
+launchctl disable gui/$UID/ai.openclaw.gateway 2>/dev/null || true
+launchctl enable gui/$UID/ai.openclaw.gateway 2>/dev/null || true
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/ai.openclaw.gateway.plist
+launchctl print gui/$UID/ai.openclaw.gateway
+```
+
+If bootstrap still fails, use manual mode (`openclaw gateway`) while fixing LaunchAgent metadata.
+
+### 3) Repair config pipeline
+
+Once only one gateway is running:
 
 ```bash
 openclaw doctor --fix
-openclaw gateway stop
-launchctl bootout gui/$UID/ai.openclaw.gateway 2>/dev/null || true
-openclaw gateway
 ```
 
-### 2) Stop bulk config applies; use minimal known-good apply
+Then apply config in tiny increments (one field at a time):
 
-Apply only minimal settings first (single change at a time), and verify logs after each apply.
+1. model only
+2. timeout only
+3. token limit only
 
-Start with:
+After each apply, verify logs do **not** show:
 
-- model only
-- then timeout only
-- then token limit only
+- `config.apply ... INVALID_REQUEST`
+- `gateway failed: invalid config`
 
-If one step triggers `INVALID_REQUEST`, that field/value is the offender.
+### 4) Only then tune latency
 
-### 3) Validate by log signatures
+If config is clean but chat still stalls:
 
-After each config change, confirm:
-
-- no `res ✗ config.apply ... INVALID_REQUEST`
-- no `[tools] gateway failed: invalid config`
-
-Only once these are clean should you continue Discord latency tuning.
-
-## Discord latency tuning (after config.apply is clean)
-
-If replies still lag after valid config applies:
-
-1. Switch Discord profile to `qwen3:8b`.
+1. Move Discord profile to `qwen3:8b`.
 2. Keep `thinking=off`.
-3. Lower max output tokens.
-4. Lower run timeout to fail fast.
+3. Lower output token budget.
+4. Lower timeout to fail fast.
 5. Put Anthropic as first fallback.
 
 ## Focused smoke test
@@ -69,13 +90,14 @@ If replies still lag after valid config applies:
 openclaw logs --follow
 ```
 
-Then send `ping` in Discord and verify:
+Send `ping` in Discord and require all of these:
 
-1. `embedded run start ... model=<active model>`
-2. no `INVALID_REQUEST` apply errors
+1. no startup conflict errors (`already running`, `port 18789 in use` from duplicate start attempts)
+2. no `config.apply ... INVALID_REQUEST`
 3. no `gateway failed: invalid config`
-4. assistant reply posted (not just typing)
+4. run start + successful end
+5. assistant message posted (not just typing)
 
-## Notes on benign warnings
+## Practical diagnosis
 
-- Bonjour name/hostname conflict auto-rename (`... (2)`, `openclaw-(2)`) is usually harmless for Discord message delivery.
+Right now the most immediate blocker is startup control conflict (manual vs supervised gateway). Fix that first, then config apply validity, then latency.
