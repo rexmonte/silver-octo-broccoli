@@ -3,26 +3,36 @@ MacMini openclaw
 
 ## Discord bot troubleshooting (online but not replying)
 
-Your latest logs show the gateway is actually healthy and connected to Discord, but the reply pipeline is stalling:
+You are absolutely thinking about this the right way: if `qwen3-coder:30b` is stalling, you should switch to a smaller local model (like 14B) or use a cloud provider profile (Anthropic).
 
-- `logged in to discord as ...` ✅
-- `listening on ws://127.0.0.1:18789` ✅
-- `embedded run start ... model=qwen3-coder:30b` ✅
-- `typing TTL reached (2m); stopping typing indicator` ⚠️
-- `Removed orphaned user message to prevent consecutive user turns` ⚠️
+Your logs show the gateway/Discord side is working, but generation is timing out:
 
-That pattern usually means **Discord events are arriving**, but the model/backend run is too slow or session state is getting stuck before a final assistant message is posted.
+- `logged in to discord as ...` ✅ (Discord auth works)
+- `embedded run start ... model=qwen3-coder:30b` ✅ (message reached agent)
+- `typing TTL reached (2m)` ⚠️ (no timely model completion)
 
-## Fastest fix path
+That means the bottleneck is **model/profile selection and latency**, not basic bot connectivity.
 
-### 1) Keep one gateway, confirm it's the one handling traffic
+## Direct answer: "Why not just use other models?"
+
+Usually one of these is happening:
+
+1. OpenClaw is pinned to a specific profile/model (`ollama/qwen3-coder:30b`) for that channel/session.
+2. Other local models exist on disk but are not selected as the active profile.
+3. The fallback profile (like Anthropic) is not configured with a valid API key, so fallback cannot succeed.
+
+So yes — your proposed fix is exactly the right move.
+
+## Fastest recovery path
+
+### 1) Keep one gateway process only
 
 ```bash
 lsof -nP -iTCP:18789 -sTCP:LISTEN
 openclaw logs --follow
 ```
 
-If you again see duplicate-start errors (`gateway already running`, port in use), stop extras and start one instance only:
+If duplicate start conflicts return, cleanly restart one instance:
 
 ```bash
 openclaw gateway stop
@@ -30,51 +40,55 @@ launchctl bootout gui/$UID/ai.openclaw.gateway 2>/dev/null || true
 openclaw gateway
 ```
 
-### 2) Switch to a faster model first (most likely blocker)
+### 2) Switch from 30B to a 14B (or smaller) local model
 
-Your run uses `ollama/qwen3-coder:30b`, which is often too slow for chat UX on local hardware.
-
-Try a smaller model/profile in OpenClaw (example: 7B/14B instruct model) and retest with a one-word prompt (`ping`).
-
-### 3) Clear stuck session state
-
-The orphaned-message warning suggests turn state drift in the existing session:
+1. List locally available models:
 
 ```bash
-# stop gateway first if needed
-openclaw gateway stop
+ollama list
+```
 
-# back up and remove stale main session data
+2. Pick a faster model you already have (for example a 14B instruct model).
+3. In OpenClaw, set the active Discord agent/profile model from `qwen3-coder:30b` to that faster model.
+4. Send a tiny Discord test prompt: `ping`.
+
+If you still get typing timeout, drop again to 7B/8B.
+
+### 3) Enable Anthropic fallback (if desired)
+
+If you want cloud fallback when local inference is slow:
+
+1. Add a valid `ANTHROPIC_API_KEY` to the OpenClaw environment/profile that the gateway actually uses.
+2. Enable/select an Anthropic profile in OpenClaw and make sure it is allowed as a fallback for Discord runs.
+3. Restart gateway after key/profile changes.
+
+Then test in Discord and confirm logs show the Anthropic profile being selected when local runs stall.
+
+### 4) Clean stale session state (recommended once)
+
+Your log had orphaned-turn cleanup warnings, so do a one-time session cleanup:
+
+```bash
+openclaw gateway stop
 mkdir -p ~/.openclaw/backup
 cp -a ~/.openclaw/agents/main/sessions ~/.openclaw/backup/sessions.$(date +%Y%m%d-%H%M%S)
 rm -f ~/.openclaw/agents/main/sessions/*.lock
+openclaw gateway
 ```
 
-Then restart gateway and test again in Discord with a fresh short message.
+## Validation checklist
 
-### 4) Verify Discord-side prerequisites
+After changing models/profiles, this is what "fixed" looks like in logs:
 
-- Bot has permission to **View Channel**, **Read Message History**, **Send Messages**.
-- Message Content Intent is enabled in the Discord developer portal if your bot logic depends on raw content.
-- Test in a clean channel with no heavy attachments first.
+- You still see `logged in to discord`.
+- `embedded run start` uses your new chosen profile/model (14B or Anthropic), not `qwen3-coder:30b`.
+- You no longer see `typing TTL reached (2m)` for short prompts.
+- Discord receives a response within a few seconds.
 
-### 5) Check Ollama health directly
+## Practical recommendation
 
-```bash
-ollama ps
-ollama list
-# optional quick latency check with your selected model
-ollama run <fast-model-name> "Reply with: pong"
-```
+For reliability, start with this order:
 
-If Ollama itself is slow/hanging, OpenClaw Discord replies will stall regardless of gateway status.
-
-## How to read the latest logs you posted
-
-- `Gateway service not loaded` at startup info is not fatal by itself; you later successfully launched a live gateway process.
-- `logged in to discord` confirms token/login is working.
-- `embedded run start` confirms Discord messages are reaching the agent.
-- `typing TTL reached (2m)` indicates the model run exceeded interactive response window.
-- `Removed orphaned user message...` indicates session turn cleanup, which can suppress expected reply flow in that run.
-
-So the most likely root cause now is **model latency + stale session state**, not Discord connectivity.
+1. Fast local model (7B/14B) as primary.
+2. Anthropic as fallback if local generation exceeds latency budget.
+3. Keep 30B for manual/high-quality tasks, not interactive Discord chat.
