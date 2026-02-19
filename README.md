@@ -1,44 +1,38 @@
 # silver-octo-broccoli
 MacMini openclaw
 
-## Discord bot troubleshooting (connected, typing, but no final reply)
+## Discord bot troubleshooting (online but not replying)
 
-### What your newest logs prove
+You are absolutely thinking about this the right way: if `qwen3-coder:30b` is stalling, you should switch to a smaller local model (like 14B) or use a cloud provider profile (Anthropic).
 
-From the log sequence you posted:
+Your logs show the gateway/Discord side is working, but generation is timing out:
 
-- Discord is connected (`logged in to discord ...`).
-- A run starts for each message (`embedded run start`).
-- The selected model is still `provider=ollama model=qwen3-coder:30b`.
-- Typing stops after 2 minutes (`typing TTL reached (2m)`).
-- The run eventually hard-times out at 10 minutes (`timeoutMs=600000`).
-- Discord listener is flagged slow (~601s).
+- `logged in to discord as ...` ✅ (Discord auth works)
+- `embedded run start ... model=qwen3-coder:30b` ✅ (message reached agent)
+- `typing TTL reached (2m)` ⚠️ (no timely model completion)
 
-So the failure mode is: **request enters the agent, but the active model/profile cannot complete quickly enough for chat.**
+That means the bottleneck is **model/profile selection and latency**, not basic bot connectivity.
 
-## Direct answer to your question
+## Direct answer: "Why not just use other models?"
 
-> "Why can’t we use the other models on disk or the 14B one, or Anthropic?"
+Usually one of these is happening:
 
-You can. The logs indicate OpenClaw is currently pinned to `ollama/qwen3-coder:30b` for this Discord path, and fallback did not rescue this run (`Profile ollama:manual timed out ... Trying next account...`).
+1. OpenClaw is pinned to a specific profile/model (`ollama/qwen3-coder:30b`) for that channel/session.
+2. Other local models exist on disk but are not selected as the active profile.
+3. The fallback profile (like Anthropic) is not configured with a valid API key, so fallback cannot succeed.
 
-Typical reasons:
+So yes — your proposed fix is exactly the right move.
 
-1. Active Discord profile is explicitly set to 30B.
-2. Other local models exist but are not selected for that profile.
-3. Anthropic fallback is not configured/authorized in the runtime environment the gateway uses.
-4. Fallback order still prioritizes another slow local account before Anthropic.
+## Fastest recovery path
 
-## Immediate fix plan (recommended)
-
-### 1) Keep only one gateway process
+### 1) Keep one gateway process only
 
 ```bash
 lsof -nP -iTCP:18789 -sTCP:LISTEN
 openclaw logs --follow
 ```
 
-If duplicate gateway starts reappear:
+If duplicate start conflicts return, cleanly restart one instance:
 
 ```bash
 openclaw gateway stop
@@ -46,30 +40,33 @@ launchctl bootout gui/$UID/ai.openclaw.gateway 2>/dev/null || true
 openclaw gateway
 ```
 
-### 2) Switch Discord profile model from 30B to 14B/7B
+### 2) Switch from 30B to a 14B (or smaller) local model
+
+1. List locally available models:
 
 ```bash
 ollama list
 ```
 
-Then set Discord/OpenClaw active model to a faster local model (14B first, then 7B if needed) and retest with `ping`.
+2. Pick a faster model you already have (for example a 14B instruct model).
+3. In OpenClaw, set the active Discord agent/profile model from `qwen3-coder:30b` to that faster model.
+4. Send a tiny Discord test prompt: `ping`.
 
-### 3) Verify fallback chain actually includes Anthropic
+If you still get typing timeout, drop again to 7B/8B.
 
-Use the profile/settings OpenClaw gateway loads and confirm:
+### 3) Enable Anthropic fallback (if desired)
 
-- `ANTHROPIC_API_KEY` is present in that runtime.
-- Anthropic profile is enabled.
-- Fallback order puts Anthropic ahead of slow/retrying local profiles.
+If you want cloud fallback when local inference is slow:
 
-Restart gateway after changes:
+1. Add a valid `ANTHROPIC_API_KEY` to the OpenClaw environment/profile that the gateway actually uses.
+2. Enable/select an Anthropic profile in OpenClaw and make sure it is allowed as a fallback for Discord runs.
+3. Restart gateway after key/profile changes.
 
-```bash
-openclaw gateway stop
-openclaw gateway
-```
+Then test in Discord and confirm logs show the Anthropic profile being selected when local runs stall.
 
-### 4) Clear stale session lock/state once
+### 4) Clean stale session state (recommended once)
+
+Your log had orphaned-turn cleanup warnings, so do a one-time session cleanup:
 
 ```bash
 openclaw gateway stop
@@ -79,18 +76,19 @@ rm -f ~/.openclaw/agents/main/sessions/*.lock
 openclaw gateway
 ```
 
-## What "fixed" should look like in logs
+## Validation checklist
 
-- `embedded run start ... model=<14B or 7B or anthropic/...>`
-- No `typing TTL reached (2m)` for short prompts.
-- No `embedded run timeout ... 600000` for normal chat.
-- No repeated `Slow listener detected` around 600s.
-- Discord receives replies in seconds.
+After changing models/profiles, this is what "fixed" looks like in logs:
 
-## Practical operating mode
+- You still see `logged in to discord`.
+- `embedded run start` uses your new chosen profile/model (14B or Anthropic), not `qwen3-coder:30b`.
+- You no longer see `typing TTL reached (2m)` for short prompts.
+- Discord receives a response within a few seconds.
 
-For stable Discord chat:
+## Practical recommendation
 
-1. Primary: fast local model (7B/14B).
-2. Fallback: Anthropic.
-3. Reserve 30B for manual/non-realtime jobs.
+For reliability, start with this order:
+
+1. Fast local model (7B/14B) as primary.
+2. Anthropic as fallback if local generation exceeds latency budget.
+3. Keep 30B for manual/high-quality tasks, not interactive Discord chat.
